@@ -1,22 +1,22 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::device::udp::UDPSocket;
 use crate::device::*;
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
 #[derive(Default, Debug)]
-pub struct Endpoint {
+pub struct Endpoint<S: Sock> {
     pub addr: Option<SocketAddr>,
-    pub conn: Option<Arc<UDPSocket>>,
+    pub conn: Option<Arc<S>>,
 }
 
-pub struct Peer {
+pub struct Peer<S: Sock> {
     pub(crate) tunnel: Box<Tunn>, // The associated tunnel struct
     index: u32,                   // The index the tunnel uses
-    endpoint: spin::RwLock<Endpoint>,
+    endpoint: RwLock<Endpoint<S>>,
     allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
 }
@@ -45,18 +45,18 @@ impl FromStr for AllowedIP {
     }
 }
 
-impl Peer {
+impl<S: Sock> Peer<S> {
     pub fn new(
         tunnel: Box<Tunn>,
         index: u32,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         preshared_key: Option<[u8; 32]>,
-    ) -> Peer {
+    ) -> Peer<S> {
         Peer {
             tunnel,
             index,
-            endpoint: spin::RwLock::new(Endpoint {
+            endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
             }),
@@ -69,13 +69,13 @@ impl Peer {
         self.tunnel.update_timers(dst)
     }
 
-    pub fn endpoint(&self) -> spin::RwLockReadGuard<'_, Endpoint> {
+    pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint<S>> {
         self.endpoint.read()
     }
 
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
-            self.log(Verbosity::Info, "Disconnecting from endpoint");
+            info!(self.tunnel.logger, "Disconnecting from endpoint");
             conn.shutdown();
         }
     }
@@ -95,11 +95,7 @@ impl Peer {
         };
     }
 
-    pub fn connect_endpoint(
-        &self,
-        port: u16,
-        fwmark: Option<u32>,
-    ) -> Result<Arc<UDPSocket>, Error> {
+    pub fn connect_endpoint(&self, port: u16, fwmark: Option<u32>) -> Result<Arc<S>, Error> {
         let mut endpoint = self.endpoint.write();
 
         if endpoint.conn.is_some() {
@@ -107,12 +103,12 @@ impl Peer {
         }
 
         let udp_conn = Arc::new(match endpoint.addr {
-            Some(addr @ SocketAddr::V4(_)) => UDPSocket::new()?
+            Some(addr @ SocketAddr::V4(_)) => S::new()?
                 .set_non_blocking()?
                 .set_reuse()?
                 .bind(port)?
                 .connect(&addr)?,
-            Some(addr @ SocketAddr::V6(_)) => UDPSocket::new6()?
+            Some(addr @ SocketAddr::V6(_)) => S::new6()?
                 .set_non_blocking()?
                 .set_reuse()?
                 .bind(port)?
@@ -124,9 +120,11 @@ impl Peer {
             udp_conn.set_fwmark(fwmark)?;
         }
 
-        self.log(
-            Verbosity::Info,
-            &format!("Connected endpoint :{}->{}", port, endpoint.addr.unwrap()),
+        info!(
+            self.tunnel.logger,
+            "Connected endpoint :{}->{}",
+            port,
+            endpoint.addr.unwrap()
         );
 
         endpoint.conn = Some(Arc::clone(&udp_conn));
@@ -156,9 +154,5 @@ impl Peer {
 
     pub fn index(&self) -> u32 {
         self.index
-    }
-
-    pub fn log(&self, level: Verbosity, e: &str) {
-        self.tunnel.log(level, e)
     }
 }

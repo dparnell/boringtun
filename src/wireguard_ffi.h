@@ -23,10 +23,10 @@ enum result_type
 
 enum log_level
 {
-    NONE = 0,
+    ERR = 0,
     INFO = 1,
-    DEB = 2,
-    ALL = 3,
+    DBG = 2,
+    TRACE = 3,
 };
 
 struct wireguard_result
@@ -41,7 +41,7 @@ struct stats
     size_t tx_bytes;
     size_t rx_bytes;
     float estimated_loss;
-    int32_t estimated_rtt; // rtt estimated on time it took to complete lateset initiated handshake in ms
+    int32_t estimated_rtt; // rtt estimated on time it took to complete latest initiated handshake in ms
     uint8_t reserved[56];  // decrement appropriately when adding new fields
 };
 
@@ -67,6 +67,8 @@ int check_base64_encoded_x25519_key(const char *key);
 // Allocate a new tunnel
 struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     const char *server_static_public,
+                                    uint16_t keep_alive, // Keep alive interval in seconds
+                                    uint32_t index,      // The 24bit index prefix to be used for session indexes
                                     void (*log_printer)(const char *),
                                     enum log_level log_level);
 

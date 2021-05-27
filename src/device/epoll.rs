@@ -3,7 +3,7 @@
 
 use super::{errno_str, Error};
 use libc::*;
-use spin::Mutex;
+use parking_lot::Mutex;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
@@ -222,8 +222,10 @@ impl<H: Sync + Send> EventPoll<H> {
     /// handler.
     pub fn wait(&self) -> WaitResult<'_, H> {
         let mut event = epoll_event { events: 0, u64: 0 };
-        if unsafe { epoll_wait(self.epoll, &mut event, 1, -1) } == -1 {
-            return WaitResult::Error(errno_str());
+        match unsafe { epoll_wait(self.epoll, &mut event, 1, -1) } {
+            -1 => return WaitResult::Error(errno_str()),
+            1 => {}
+            _ => return WaitResult::Error("unexpected number of events returned".to_string()),
         }
 
         let event_data = unsafe { (event.u64 as *mut Event<H>).as_mut().unwrap() };
@@ -378,5 +380,29 @@ impl<'a, H> EventGuard<'a, H> {
     pub fn cancel(self) {
         unsafe { self.poll.clear_event_by_fd(self.event.fd) };
         std::mem::forget(self); // Don't call the regular drop that would enable the event
+    }
+
+    /// Change the event flags to enable or disable notifying when the fd is writable
+    pub fn notify_writable(&mut self, enabled: bool) {
+        let flags = if enabled {
+            EPOLLOUT | EPOLLIN | EPOLLET | EPOLLONESHOT
+        } else {
+            EPOLLIN | EPOLLONESHOT
+        };
+        self.event.event.events = flags as _;
+    }
+}
+
+pub fn block_signal(signal: c_int) -> Result<sigset_t, String> {
+    unsafe {
+        let mut sigset = std::mem::zeroed();
+        sigemptyset(&mut sigset);
+        if sigaddset(&mut sigset, signal) == -1 {
+            return Err(errno_str());
+        }
+        if sigprocmask(SIG_BLOCK, &sigset, null_mut()) == -1 {
+            return Err(errno_str());
+        }
+        Ok(sigset)
     }
 }

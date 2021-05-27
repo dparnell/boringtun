@@ -1,10 +1,10 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use super::dev_lock::LockReadGuard;
+use super::drop_privileges::*;
 use super::{make_array, AllowedIP, Device, Error, SocketAddr, X25519PublicKey, X25519SecretKey};
-use crate::dev_lock::LockReadGuard;
-use crate::device::drop_privileges::*;
-use crate::device::Action;
+use crate::device::{Action, Sock, Tun};
 use hex::encode as encode_hex;
 use libc::*;
 use std::fs::{create_dir, remove_file};
@@ -32,7 +32,7 @@ fn create_sock_dir() {
     }
 }
 
-impl Device {
+impl<T: Tun, S: Sock> Device<T, S> {
     /// Register the api handler for this Device. The api handler receives stream connections on a Unix socket
     /// with a known path: /var/run/wireguard/{tun_name}.sock.
     pub fn register_api_handler(&mut self) -> Result<(), Error> {
@@ -118,7 +118,7 @@ impl Device {
 }
 
 #[allow(unused_must_use)]
-fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
+fn api_get<T: Tun, S: Sock>(writer: &mut BufWriter<&UnixStream>, d: &Device<T, S>) -> i32 {
     // get command requires an empty line, but there is no reason to be religious about it
     if let Some(ref k) = d.key_pair {
         writeln!(writer, "private_key={}", encode_hex(k.0.as_bytes()));
@@ -126,6 +126,10 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
 
     if d.listen_port != 0 {
         writeln!(writer, "listen_port={}", d.listen_port);
+    }
+
+    if let Some(fwmark) = d.fwmark {
+        writeln!(writer, "fwmark={}", fwmark);
     }
 
     for (k, p) in d.peers.iter() {
@@ -137,10 +141,6 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
 
         if let Some(keepalive) = p.persistent_keepalive() {
             writeln!(writer, "persistent_keepalive_interval={}", keepalive);
-        }
-
-        if let Some(fwmark) = d.fwmark {
-            writeln!(writer, "fwmark={}", fwmark);
         }
 
         if let Some(ref addr) = p.endpoint().addr {
@@ -164,72 +164,74 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     0
 }
 
-fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
-    // We need to get a write lock on the device first
-    let mut write_mark = match d.mark_want_write() {
-        None => return EIO,
-        Some(lock) => lock,
-    };
+fn api_set<'a, T: Tun, S: Sock>(
+    reader: &mut BufReader<&UnixStream>,
+    d: &mut LockReadGuard<Device<T, S>>,
+) -> i32 {
+    d.try_writeable(
+        |device| device.trigger_yield(),
+        |device| {
+            device.cancel_yield();
 
-    write_mark.trigger_yield();
-    let mut device = write_mark.write();
-    device.cancel_yield();
+            let mut cmd = String::new();
 
-    let mut cmd = String::new();
+            while let Ok(_) = reader.read_line(&mut cmd) {
+                cmd.pop(); // remove newline if any
+                if cmd.is_empty() {
+                    return 0; // Done
+                }
+                {
+                    let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+                    if parsed_cmd.len() != 2 {
+                        return EPROTO;
+                    }
 
-    while let Ok(_) = reader.read_line(&mut cmd) {
-        cmd.pop(); // remove newline if any
-        if cmd.is_empty() {
-            return 0; // Done
-        }
-        {
-            let parsed_cmd: Vec<&str> = cmd.split('=').collect();
-            if parsed_cmd.len() != 2 {
-                return EPROTO;
+                    let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+
+                    match key {
+                        "private_key" => match val.parse::<X25519SecretKey>() {
+                            Ok(key) => device.set_key(key),
+                            Err(_) => return EINVAL,
+                        },
+                        "listen_port" => match val.parse::<u16>() {
+                            Ok(port) => match device.open_listen_socket(port) {
+                                Ok(()) => {}
+                                Err(_) => return EADDRINUSE,
+                            },
+                            Err(_) => return EINVAL,
+                        },
+                        "fwmark" => match val.parse::<u32>() {
+                            Ok(mark) => match device.set_fwmark(mark) {
+                                Ok(()) => {}
+                                Err(_) => return EADDRINUSE,
+                            },
+                            Err(_) => return EINVAL,
+                        },
+                        "replace_peers" => match val.parse::<bool>() {
+                            Ok(true) => device.clear_peers(),
+                            Ok(false) => {}
+                            Err(_) => return EINVAL,
+                        },
+                        "public_key" => match val.parse::<X25519PublicKey>() {
+                            // Indicates a new peer section
+                            Ok(key) => return api_set_peer(reader, device, key),
+                            Err(_) => return EINVAL,
+                        },
+                        _ => return EINVAL,
+                    }
+                }
+                cmd.clear();
             }
 
-            let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
-
-            match key {
-                "private_key" => match val.parse::<X25519SecretKey>() {
-                    Ok(key) => device.set_key(key),
-                    Err(_) => return EINVAL,
-                },
-                "listen_port" => match val.parse::<u16>() {
-                    Ok(port) => match device.open_listen_socket(port) {
-                        Ok(()) => {}
-                        Err(_) => return EADDRINUSE,
-                    },
-                    Err(_) => return EINVAL,
-                },
-                "fwmark" => match val.parse::<u32>() {
-                    Ok(mark) => match device.set_fwmark(mark) {
-                        Ok(()) => {}
-                        Err(_) => return EADDRINUSE,
-                    },
-                    Err(_) => return EINVAL,
-                },
-                "replace_peers" => match val.parse::<bool>() {
-                    Ok(true) => device.clear_peers(),
-                    Ok(false) => {}
-                    Err(_) => return EINVAL,
-                },
-                "public_key" => match val.parse::<X25519PublicKey>() {
-                    // Indicates a new peer section
-                    Ok(key) => return api_set_peer(reader, &mut device, key),
-                    Err(_) => return EINVAL,
-                },
-                _ => return EINVAL,
-            }
-        }
-        cmd.clear();
-    }
-    0
+            0
+        },
+    )
+    .unwrap_or(EIO)
 }
 
-fn api_set_peer(
+fn api_set_peer<T: Tun, S: Sock>(
     reader: &mut BufReader<&UnixStream>,
-    d: &mut Device,
+    d: &mut Device<T, S>,
     pub_key: X25519PublicKey,
 ) -> i32 {
     let mut cmd = String::new();
@@ -256,7 +258,7 @@ fn api_set_peer(
             return 0; // Done
         }
         {
-            let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+            let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
             if parsed_cmd.len() != 2 {
                 return EPROTO;
             }
@@ -302,7 +304,7 @@ fn api_set_peer(
                         preshared_key,
                     );
                     match val.parse::<X25519PublicKey>() {
-                        Ok(key) => return api_set_peer(reader, d, key),
+                        Ok(key) => return api_set_peer::<T, S>(reader, d, key),
                         Err(_) => return EINVAL,
                     }
                 }

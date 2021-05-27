@@ -3,7 +3,8 @@
 
 use self::TimerName::*;
 use super::errors::WireGuardError;
-use crate::noise::{Tunn, TunnResult, Verbosity};
+use crate::noise::{Tunn, TunnResult};
+use slog::debug;
 use std::ops::Index;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -150,8 +151,8 @@ impl Tunn {
 
         for (i, t) in timers.session_timers.iter().enumerate() {
             if time_now - t.time() > REJECT_AFTER_TIME {
-                if (*self.sessions[i].write()).take().is_some() {
-                    self.log(Verbosity::Debug, "SESSION_EXPIRED(REJECT_AFTER_TIME)");
+                if let Some(session) = self.sessions[i].write().take() {
+                    debug!(self.logger, "SESSION_EXPIRED(REJECT_AFTER_TIME)"; "session" => session.receiving_index);
                 }
                 t.set(time_now);
             }
@@ -205,7 +206,7 @@ impl Tunn {
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
             if now - session_established >= REJECT_AFTER_TIME * 3 {
-                self.log(Verbosity::Info, "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
+                debug!(self.logger, "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
                 handshake.set_expired();
                 self.clear_all();
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
@@ -218,7 +219,7 @@ impl Tunn {
                     // the retries give up and cease, and clear all existing packets queued
                     // up to be sent. If a packet is explicitly queued up to be sent, then
                     // this timer is reset.
-                    self.log(Verbosity::Info, "CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+                    debug!(self.logger, "CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
                     handshake.set_expired();
                     self.clear_all();
                     return TunnResult::Err(WireGuardError::ConnectionExpired);
@@ -230,7 +231,7 @@ impl Tunn {
                     // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
                     // if a response has not been received, where jitter is some random
                     // value between 0 and 333 ms.
-                    self.log(Verbosity::Debug, "HANDSHAKE(REKEY_TIMEOUT)");
+                    debug!(self.logger, "HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }
             } else {
@@ -243,7 +244,7 @@ impl Tunn {
                     if session_established < data_packet_sent
                         && now - session_established >= REKEY_AFTER_TIME
                     {
-                        self.log(Verbosity::Debug, "HANDSHAKE(REKEY_AFTER_TIME (on send))");
+                        debug!(self.logger, "HANDSHAKE(REKEY_AFTER_TIME (on send))");
                         handshake_initiation_required = true;
                     }
 
@@ -255,10 +256,7 @@ impl Tunn {
                         && now - session_established
                             >= REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
                     {
-                        self.log(
-                        Verbosity::Debug,
-                        "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT (on receive))",
-                    );
+                        debug!(self.logger, "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT (on receive))");
                         handshake_initiation_required = true;
                     }
                 }
@@ -266,22 +264,22 @@ impl Tunn {
                 // If we have sent a packet to a given peer but have not received a
                 // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms,
                 // we initiate a new handshake.
-                if aut_packet_sent > aut_packet_received
-                    && now - aut_packet_sent >= KEEPALIVE_TIMEOUT + REKEY_TIMEOUT
+                if data_packet_sent > aut_packet_received
+                    && now - aut_packet_received >= KEEPALIVE_TIMEOUT + REKEY_TIMEOUT
                     && timers.want_handshake.swap(false, Ordering::Relaxed)
                 {
-                    self.log(Verbosity::Debug, "HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
+                    debug!(self.logger, "HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }
 
                 if !handshake_initiation_required {
                     // If a packet has been received from a given peer, but we have not sent one back
                     // to the given peer in KEEPALIVE ms, we send an empty packet.
-                    if aut_packet_received > aut_packet_sent
-                        && now - aut_packet_received >= KEEPALIVE_TIMEOUT
+                    if data_packet_received > aut_packet_sent
+                        && now - aut_packet_sent >= KEEPALIVE_TIMEOUT
                         && timers.want_keepalive.swap(false, Ordering::Relaxed)
                     {
-                        self.log(Verbosity::Debug, "KEEPALIVE(KEEPALIVE_TIMEOUT)");
+                        debug!(self.logger, "KEEPALIVE(KEEPALIVE_TIMEOUT)");
                         keepalive_required = true;
                     }
 
@@ -290,7 +288,7 @@ impl Tunn {
                         && (now - timers[TimePersistentKeepalive].time()
                             >= Duration::from_secs(persistent_keepalive as _))
                     {
-                        self.log(Verbosity::Debug, "KEEPALIVE(PERSISTENT_KEEPALIVE)");
+                        debug!(self.logger, "KEEPALIVE(PERSISTENT_KEEPALIVE)");
                         self.timer_tick(TimePersistentKeepalive);
                         keepalive_required = true;
                     }
